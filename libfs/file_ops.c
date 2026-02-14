@@ -413,3 +413,104 @@ void my_get_fs_stats(void) {
     printf("  Free space (approx): %llu bytes\n", (unsigned long long)free_bytes);
     printf("  Number of files: %u\n", sb.num_files);
 }
+
+int my_cp(const char *src_path, const char *dst_path) {
+    // Resolve source
+    char abs_src[1024], abs_dst[1024];
+    make_absolute(src_path, abs_src, sizeof(abs_src));
+    make_absolute(dst_path, abs_dst, sizeof(abs_dst));
+
+    int src_idx = resolve_path(abs_src);
+    if (src_idx < 0) {
+        fprintf(stderr, "cp: source '%s' not found.\n", abs_src);
+        return -1;
+    }
+    FileEntry *src = &file_table[src_idx];
+    if (src->type != FS_TYPE_REGULAR) {
+        fprintf(stderr, "cp: cannot copy directory '%s'.\n", abs_src);
+        return -1;
+    }
+    if (!can_read_file(src)) {
+        fprintf(stderr, "cp: permission denied reading '%s'.\n", abs_src);
+        return -1;
+    }
+
+    // Resolve destination
+    // If dst already exists and is a directory, copy into it with src's basename
+    int dst_idx = resolve_path(abs_dst);
+    int parent_dir;
+    char dst_name[FS_FILENAME_MAX];
+
+    if (dst_idx >= 0 && file_table[dst_idx].type == FS_TYPE_DIRECTORY) {
+        // Copy into directory: /dst_dir/<src-basename>
+        parent_dir = dst_idx;
+        strncpy(dst_name, src->name, FS_FILENAME_MAX - 1);
+        dst_name[FS_FILENAME_MAX - 1] = '\0';
+        // Check if already exists inside
+        if (dir_find_entry(parent_dir, dst_name) >= 0) {
+            fprintf(stderr, "cp: '%s/%s' already exists.\n", abs_dst, dst_name);
+            return -1;
+        }
+    } else if (dst_idx >= 0) {
+        // Destination file already exists
+        fprintf(stderr, "cp: destination '%s' already exists.\n", abs_dst);
+        return -1;
+    } else {
+        // Destination doesn't exist — treat as new file
+        if (resolve_path_parent(abs_dst, &parent_dir, dst_name) != 0) {
+            fprintf(stderr, "cp: cannot resolve parent of '%s'.\n", abs_dst);
+            return -1;
+        }
+    }
+
+    // Create destination file entry
+    int new_idx = fs_allocate_file_entry(dst_name, FS_TYPE_REGULAR,
+            src->permissions, parent_dir);
+    if (new_idx < 0) {
+        fprintf(stderr, "cp: cannot create destination file.\n");
+        return -1;
+    }
+
+    // Copy data block by block
+    FileEntry *dst_fe = &file_table[new_idx];
+    uint32_t src_blk = src->first_block;
+    uint32_t dst_last = FS_INVALID_BLOCK;
+    BlockOnDisk src_data, dst_data;
+
+    while (src_blk != FS_INVALID_BLOCK) {
+        fs_read_block(src_blk, &src_data);
+
+        // Allocate a new block for dst
+        uint32_t new_blk;
+        if (fs_allocate_block(&new_blk) != 0) {
+            fprintf(stderr, "cp: out of disk space during copy.\n");
+            return -1;
+        }
+
+        // Copy data content
+        memcpy(&dst_data, &src_data, sizeof(BlockOnDisk));
+        dst_data.next_block = FS_INVALID_BLOCK;
+        fs_write_block(new_blk, &dst_data);
+
+        // Link into destination chain
+        if (dst_fe->first_block == FS_INVALID_BLOCK) {
+            dst_fe->first_block = new_blk;
+        } else {
+            BlockOnDisk prev;
+            fs_read_block(dst_last, &prev);
+            prev.next_block = new_blk;
+            fs_write_block(dst_last, &prev);
+        }
+        dst_last = new_blk;
+
+        src_blk = src_data.next_block;
+    }
+
+    dst_fe->size = src->size;
+    dst_fe->owner_uid = current_uid;
+    dst_fe->owner_gid = current_gid;
+    fs_sync_metadata();
+
+    printf("Copied '%s' -> '%s'.\n", abs_src, abs_dst);
+    return 0;
+}

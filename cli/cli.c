@@ -308,6 +308,7 @@ static void print_help(void) {
     printf("  shrink <new_size>     - truncate current file to new_size bytes\n");
     printf("  get_file_stats        - print size of current file\n");
     printf("  rm                    - delete current file (must be open)\n");
+    printf("  cp <src> <dst>        - copy a file\n");
     printf("  close                 - close current file\n");
     printf("  ls [path]             - list directory contents (default: cwd)\n");
     printf("  mkdir <path>          - create a directory (e.g. /sub/dir)\n");
@@ -408,6 +409,14 @@ int main(void) {
                 printf("Current file size: %u bytes\n", sz);
         } else if (strcmp(cmd, "rm") == 0) {
             my_rm();
+        } else if (strcmp(cmd, "cp") == 0) {
+            char *src = strtok(NULL, " \t");
+            char *dst = strtok(NULL, " \t");
+            if (!src || !dst) {
+                printf("Usage: cp <source> <destination>\n");
+                continue;
+            }
+            my_cp(src, dst);
         } else if (strcmp(cmd, "close") == 0) {
             my_close();
         } else if (strcmp(cmd, "ls") == 0) {
