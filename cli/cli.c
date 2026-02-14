@@ -309,7 +309,7 @@ static void print_help(void) {
     printf("  get_file_stats        - print size of current file\n");
     printf("  rm                    - delete current file (must be open)\n");
     printf("  close                 - close current file\n");
-    printf("  ls                    - list all files with permissions\n");
+    printf("  ls [path]             - list directory contents (default: cwd)\n");
     printf("  mkdir <path>          - create a directory (e.g. /sub/dir)\n");
     printf("  cd [path]             - change directory (no arg = root)\n");
     printf("  pwd                   - print working directory\n\n");
@@ -411,7 +411,8 @@ int main(void) {
         } else if (strcmp(cmd, "close") == 0) {
             my_close();
         } else if (strcmp(cmd, "ls") == 0) {
-            cmd_ls();
+            char *path = strtok(NULL, " \t");
+            cmd_ls(path);  // NULL means cwd
         } else if (strcmp(cmd, "pwd") == 0) {
             printf("%s\n", cwd_path);
         } else if (strcmp(cmd, "get_fs_stats") == 0) {

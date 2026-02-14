@@ -2,6 +2,8 @@
 #define VIZ_H
 
 void cmd_viz(void);
-void cmd_ls(void);
+
+// List directory contents. If dir_path is NULL, lists cwd.
+void cmd_ls(const char *dir_path);
 
 #endif /* VIZ_H */

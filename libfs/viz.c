@@ -1,8 +1,11 @@
 #include <stdio.h>
+#include <string.h>
 #include "viz.h"
 #include "fs_state.h"
+#include "disk_io.h"
 #include "bitmap.h"
 #include "user.h"
+#include "dir.h"
 #include "../common/fs_config.h"
 
 // Visualization Command
@@ -84,17 +87,66 @@ void cmd_viz(void) {
     printf("  |_____________________________________|\n\n");
 }
 
-// ls command - list files with permissions
-void cmd_ls(void) {
-    printf("Files in filesystem:\n");
+// ls command - list directory contents
+void cmd_ls(const char *dir_path) {
+    // Determine which directory to list
+    int dir_idx;
+    char abs_path[1024];
+
+    if (!dir_path) {
+        dir_idx = cwd_index;
+        strncpy(abs_path, cwd_path, sizeof(abs_path) - 1);
+        abs_path[sizeof(abs_path) - 1] = '\0';
+    } else {
+        make_absolute(dir_path, abs_path, sizeof(abs_path));
+        dir_idx = resolve_path(abs_path);
+        if (dir_idx < 0) {
+            fprintf(stderr, "ls: cannot access '%s': No such file or directory\n", abs_path);
+            return;
+        }
+        if (file_table[dir_idx].type != FS_TYPE_DIRECTORY) {
+            // If it's a regular file, just show that one file
+            FileEntry *fe = &file_table[dir_idx];
+            char perm_str[11];
+            perm_str[0] = '-';
+            format_permissions(fe->permissions, perm_str + 1);
+            printf("  %-10s %-12s %-12s %8u  %s\n",
+                   perm_str,
+                   fs_get_username(fe->owner_uid),
+                   fs_get_groupname(fe->owner_gid),
+                   fe->size,
+                   fe->name);
+            return;
+        }
+    }
+
+    if (dir_idx < 0 || !file_table[dir_idx].in_use) {
+        fprintf(stderr, "ls: directory not found\n");
+        return;
+    }
+
+    printf("Directory: %s\n", abs_path);
     printf("  %-10s %-12s %-12s %8s  %-s\n", "Perms", "Owner", "Group", "Size", "Name");
     printf("  %-10s %-12s %-12s %8s  %-s\n", "----------", "------------", "------------", "--------", "----");
 
-    for (int i = 0; i < FS_MAX_FILES; ++i) {
-        if (file_table[i].in_use) {
-            FileEntry *fe = &file_table[i];
+    // Walk the directory's data blocks and print each entry
+    FileEntry *dir = &file_table[dir_idx];
+    uint32_t blk_idx = dir->first_block;
+    BlockOnDisk blk;
+    uint32_t count = 0;
+
+    while (blk_idx != FS_INVALID_BLOCK) {
+        fs_read_block(blk_idx, &blk);
+        DirEntry *entries = (DirEntry *)blk.data;
+
+        for (uint32_t i = 0; i < DIRENTS_PER_BLOCK; i++) {
+            if (entries[i].file_index == FS_INVALID_ENTRY) continue;
+            int fi = entries[i].file_index;
+            if (fi < 0 || fi >= FS_MAX_FILES || !file_table[fi].in_use) continue;
+
+            FileEntry *fe = &file_table[fi];
             char perm_str[11];
-            perm_str[0] = '-'; // regular file
+            perm_str[0] = (fe->type == FS_TYPE_DIRECTORY) ? 'd' : '-';
             format_permissions(fe->permissions, perm_str + 1);
 
             printf("  %-10s %-12s %-12s %8u  %s\n",
@@ -102,8 +154,11 @@ void cmd_ls(void) {
                    fs_get_username(fe->owner_uid),
                    fs_get_groupname(fe->owner_gid),
                    fe->size,
-                   fe->name);
+                   entries[i].name);
+            count++;
         }
+        blk_idx = blk.next_block;
     }
-    printf("\nTotal files: %u\n", sb.num_files);
+
+    printf("\nTotal entries: %u\n", count);
 }
