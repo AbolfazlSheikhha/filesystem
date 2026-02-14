@@ -8,11 +8,11 @@ modules.order
 Module.symvers
 
 # Binaries
-deadbeef_cli
-mkfs.deadbeef
+mkfs_deadbeef
 
-# Disk image
+# Disk images
 filesys.db
+*.img
 
 # Editor
 *.swp
@@ -20,8 +20,8 @@ filesys.db
 *~
 .vscode/
 
+# LKM build artifacts
 docs/
-mkfs_deadbeef
 lkm/*.o
 lkm/*.ko
 lkm/*.mod*
