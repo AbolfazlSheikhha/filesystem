@@ -13,15 +13,6 @@
 
 // ------------ Internal helpers ------------
 
-static int fs_find_file_by_name(const char *name) {
-    for (int i = 0; i < FS_MAX_FILES; ++i) {
-        if (file_table[i].in_use && strncmp(file_table[i].name, name, FS_FILENAME_MAX) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 static int fs_allocate_file_entry(const char *name, uint32_t type, uint32_t perm, int parent_dir) {
     for (int i = 0; i < FS_MAX_FILES; ++i) {
         if (!file_table[i].in_use) {
@@ -159,46 +150,64 @@ static int fs_ensure_capacity(FileEntry *fe, uint32_t required_size) {
 
 // ------------ Public API ------------
 
-int my_open(const char *filename, uint32_t flags) {
+int my_open(const char *path, uint32_t flags) {
     if (current_file_index != -1) {
         fprintf(stderr, "A file is already open. Close it first.\n");
         return -1;
     }
-    int idx = fs_find_file_by_name(filename);
+
+    // If bare name (no '/'), treat as /name (relative to root for now)
+    char abs_path[1024];
+    if (path[0] != '/') {
+        snprintf(abs_path, sizeof(abs_path), "/%s", path);
+    } else {
+        strncpy(abs_path, path, sizeof(abs_path) - 1);
+        abs_path[sizeof(abs_path) - 1] = '\0';
+    }
+
+    // Try to resolve the full path first
+    int idx = resolve_path(abs_path);
     if (idx < 0) {
         if (!(flags & FLAG_CREATE)) {
-            fprintf(stderr, "File '%s' not found and CREATE flag not set.\n", filename);
+            fprintf(stderr, "File '%s' not found and CREATE flag not set.\n", abs_path);
+            return -1;
+        }
+        // Resolve parent directory and extract basename
+        int parent_dir;
+        char basename[FS_FILENAME_MAX];
+        if (resolve_path_parent(abs_path, &parent_dir, basename) != 0) {
+            fprintf(stderr, "Cannot resolve parent directory of '%s'.\n", abs_path);
             return -1;
         }
         // Create file with default permissions rw-r--r-- (0644)
-        idx = fs_allocate_file_entry(filename, FS_TYPE_REGULAR,
+        idx = fs_allocate_file_entry(basename, FS_TYPE_REGULAR,
                 PERM_OWNER_READ | PERM_OWNER_WRITE | PERM_GROUP_READ | PERM_OTHER_READ,
-                root_dir_index);
+                parent_dir);
         if (idx < 0) {
             fprintf(stderr, "No free file entries available.\n");
             return -1;
         }
         printf("Created file '%s' (owner: %s, group: %s).\n",
-               filename, fs_get_username(current_uid), fs_get_groupname(current_gid));
+               abs_path, fs_get_username(current_uid), fs_get_groupname(current_gid));
     } else {
         // Check permissions for existing file
         FileEntry *fe = &file_table[idx];
 
         // Check read permission
         if (!can_read_file(fe)) {
-            fprintf(stderr, "Permission denied: Cannot read file '%s'.\n", filename);
+            fprintf(stderr, "Permission denied: Cannot read file '%s'.\n", abs_path);
             return -1;
         }
 
         // Check write permission if WRITE flag is set
         if ((flags & FLAG_WRITE) && !can_write_file(fe)) {
-            fprintf(stderr, "Permission denied: Cannot write to file '%s'.\n", filename);
+            fprintf(stderr, "Permission denied: Cannot write to file '%s'.\n", abs_path);
             return -1;
         }
     }
     current_file_index = idx;
     current_file_flags = flags;
-    printf("Opened file '%s' (index %d).\n", filename, idx);
+    printf("Opened file '%s' (index %d).\n", abs_path, idx);
     return 0;
 }
 

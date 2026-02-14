@@ -302,7 +302,7 @@ static void print_help(void) {
     printf("\n=== File Management System Commands ===\n\n");
 
     printf("File Operations:\n");
-    printf("  open <name> <flags>   - flags bitmask: 1=CREATE, 2=WRITE\n");
+    printf("  open <path> <flags>   - flags bitmask: 1=CREATE, 2=WRITE\n");
     printf("  read <pos> <n>        - read n bytes from current file starting at pos\n");
     printf("  write <pos> <text>    - write the given text starting at pos\n");
     printf("  shrink <new_size>     - truncate current file to new_size bytes\n");
@@ -310,7 +310,7 @@ static void print_help(void) {
     printf("  rm                    - delete current file (must be open)\n");
     printf("  close                 - close current file\n");
     printf("  ls                    - list all files with permissions\n");
-    printf("  mkdir <name>          - create a directory in root\n\n");
+    printf("  mkdir <path>          - create a directory (e.g. /sub/dir)\n\n");
 
     printf("User Management:\n");
     printf("  useradd <username>    - create a new user\n");
@@ -359,7 +359,7 @@ int main(void) {
             char *name = strtok(NULL, " \t");
             char *flags_str = strtok(NULL, " \t");
             if (!name || !flags_str) {
-                printf("Usage: open <name> <flags>\n");
+                printf("Usage: open <path> <flags>\n");
                 continue;
             }
             uint32_t flags = (uint32_t)strtoul(flags_str, NULL, 0);
@@ -417,14 +417,28 @@ int main(void) {
         } else if (strcmp(cmd, "stressTest") == 0) {
             stressTest();
         } else if (strcmp(cmd, "mkdir") == 0) {
-            char *name = strtok(NULL, " \t");
-            if (!name) {
-                printf("Usage: mkdir <name>\n");
+            char *path = strtok(NULL, " \t");
+            if (!path) {
+                printf("Usage: mkdir <path>\n");
                 continue;
             }
-            int idx = dir_mkdir(root_dir_index, name);
+            // If bare name, treat as /name
+            char abs_path[1024];
+            if (path[0] != '/') {
+                snprintf(abs_path, sizeof(abs_path), "/%s", path);
+            } else {
+                strncpy(abs_path, path, sizeof(abs_path) - 1);
+                abs_path[sizeof(abs_path) - 1] = '\0';
+            }
+            int parent_dir;
+            char basename[FS_FILENAME_MAX];
+            if (resolve_path_parent(abs_path, &parent_dir, basename) != 0) {
+                fprintf(stderr, "Cannot resolve parent of '%s'.\n", abs_path);
+                continue;
+            }
+            int idx = dir_mkdir(parent_dir, basename);
             if (idx >= 0) {
-                printf("Directory '%s' created.\n", name);
+                printf("Directory '%s' created.\n", abs_path);
             }
         // User management commands
         } else if (strcmp(cmd, "useradd") == 0) {

@@ -199,3 +199,90 @@ int dir_mkdir(int parent_dir_index, const char *name) {
     fs_sync_metadata();
     return slot;
 }
+
+// ------------ Path Resolution ------------
+
+// Resolve an absolute path like "/foo/bar/baz" to a file_table index.
+// Walking starts at root_dir_index.
+int resolve_path(const char *path) {
+    if (!path || path[0] != '/') {
+        fprintf(stderr, "resolve_path: only absolute paths supported.\n");
+        return -1;
+    }
+
+    // "/" alone → root directory
+    if (strcmp(path, "/") == 0) return root_dir_index;
+
+    // Make a mutable copy to tokenize
+    char buf[1024];
+    strncpy(buf, path, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    int cur = root_dir_index;
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, "/", &saveptr);
+
+    while (tok) {
+        if (cur < 0) return -1;
+        // cur must be a directory to descend into
+        if (!file_table[cur].in_use || file_table[cur].type != FS_TYPE_DIRECTORY) {
+            fprintf(stderr, "resolve_path: '%s' is not a directory.\n",
+                    file_table[cur].name);
+            return -1;
+        }
+        int next = dir_find_entry(cur, tok);
+        if (next < 0) {
+            return -1;
+        }
+        cur = next;
+        tok = strtok_r(NULL, "/", &saveptr);
+    }
+    return cur;
+}
+
+// Resolve everything except the last component.
+// Stores the parent dir index and the basename.
+int resolve_path_parent(const char *path, int *parent_out, char *basename_out) {
+    if (!path || path[0] != '/') {
+        fprintf(stderr, "resolve_path_parent: only absolute paths supported.\n");
+        return -1;
+    }
+
+    // Find the last '/' to split parent path from basename
+    const char *last_slash = strrchr(path, '/');
+    if (!last_slash) return -1;
+
+    // Extract basename
+    const char *base = last_slash + 1;
+    if (*base == '\0') {
+        fprintf(stderr, "resolve_path_parent: path ends with '/'.\n");
+        return -1;
+    }
+    strncpy(basename_out, base, FS_FILENAME_MAX - 1);
+    basename_out[FS_FILENAME_MAX - 1] = '\0';
+
+    // Parent path
+    if (last_slash == path) {
+        // Parent is root: path like "/foo"
+        *parent_out = root_dir_index;
+        return 0;
+    }
+
+    // Build parent path string
+    size_t parent_len = (size_t)(last_slash - path);
+    char parent_path[1024];
+    if (parent_len >= sizeof(parent_path)) parent_len = sizeof(parent_path) - 1;
+    memcpy(parent_path, path, parent_len);
+    parent_path[parent_len] = '\0';
+
+    int parent = resolve_path(parent_path);
+    if (parent < 0) return -1;
+
+    if (file_table[parent].type != FS_TYPE_DIRECTORY) {
+        fprintf(stderr, "resolve_path_parent: '%s' is not a directory.\n", parent_path);
+        return -1;
+    }
+
+    *parent_out = parent;
+    return 0;
+}

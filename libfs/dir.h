@@ -18,4 +18,14 @@ int dir_find_entry(int dir_index, const char *name);
 // Returns the file_table index of the new directory, or -1 on failure.
 int dir_mkdir(int parent_dir_index, const char *name);
 
+// Resolve an absolute path (e.g. "/foo/bar/baz") to a file_table index.
+// Returns the file_table index of the final component, or -1 on failure.
+int resolve_path(const char *path);
+
+// Resolve all components of a path except the last one.
+// Stores the parent directory index in *parent_out and copies the
+// basename (last component) into basename_out (must be >= FS_FILENAME_MAX).
+// Returns 0 on success, -1 on failure.
+int resolve_path_parent(const char *path, int *parent_out, char *basename_out);
+
 #endif /* DIR_H */
