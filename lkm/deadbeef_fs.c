@@ -952,7 +952,7 @@ static int deadbeef_unlink(struct inode *dir, struct dentry *dentry)
 	deadbeef_sync_metadata(sb);
 	up_write(&sbi->meta_rwsem);
 
-	inode_dec_link_count(inode);
+	clear_nlink(inode);
 	return 0;
 }
 
@@ -975,7 +975,7 @@ static int deadbeef_rmdir(struct inode *dir, struct dentry *dentry)
 	inode_dec_link_count(dir);
 	up_write(&sbi->meta_rwsem);
 
-	inode_dec_link_count(inode);
+	clear_nlink(inode);
 	return 0;
 }
 
