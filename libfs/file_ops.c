@@ -7,6 +7,7 @@
 #include "disk_io.h"
 #include "bitmap.h"
 #include "user.h"
+#include "dir.h"
 #include "../common/fs_config.h"
 #include "../common/fs_layout.h"
 
@@ -21,7 +22,7 @@ static int fs_find_file_by_name(const char *name) {
     return -1;
 }
 
-static int fs_allocate_file_entry(const char *name, uint32_t type, uint32_t perm) {
+static int fs_allocate_file_entry(const char *name, uint32_t type, uint32_t perm, int parent_dir) {
     for (int i = 0; i < FS_MAX_FILES; ++i) {
         if (!file_table[i].in_use) {
             FileEntry *fe = &file_table[i];
@@ -39,6 +40,16 @@ static int fs_allocate_file_entry(const char *name, uint32_t type, uint32_t perm
             fe->in_use = 1;
             sb.root_dir_head = i;
             sb.num_files++;
+
+            // Add entry to parent directory
+            if (parent_dir >= 0) {
+                if (dir_add_entry(parent_dir, name, i) != 0) {
+                    // Rollback
+                    fe->in_use = 0;
+                    sb.num_files--;
+                    return -1;
+                }
+            }
 
             fs_sync_metadata();
             return i;
@@ -76,6 +87,31 @@ static void fs_delete_file_entry(int index) {
             prev = file_table[prev].next_entry;
         }
     }
+    // Remove from parent directory dirent
+    // Search all directories for an entry pointing to this index
+    for (int d = 0; d < FS_MAX_FILES; ++d) {
+        if (file_table[d].in_use && file_table[d].type == FS_TYPE_DIRECTORY) {
+            // Try to remove - dir_remove_entry will just return -1 if not found
+            uint32_t blk_idx = file_table[d].first_block;
+            BlockOnDisk dblk;
+            while (blk_idx != FS_INVALID_BLOCK) {
+                fs_read_block(blk_idx, &dblk);
+                DirEntry *entries = (DirEntry *)dblk.data;
+                for (uint32_t j = 0; j < DIRENTS_PER_BLOCK; j++) {
+                    if (entries[j].file_index == index) {
+                        memset(entries[j].name, 0, FS_FILENAME_MAX);
+                        entries[j].file_index = FS_INVALID_ENTRY;
+                        fs_write_block(blk_idx, &dblk);
+                        file_table[d].size--;
+                        goto dirent_removed;
+                    }
+                }
+                blk_idx = dblk.next_block;
+            }
+        }
+    }
+dirent_removed:
+
     file_table[index].in_use = 0;
     sb.num_files--;
     fs_sync_metadata();
@@ -135,7 +171,9 @@ int my_open(const char *filename, uint32_t flags) {
             return -1;
         }
         // Create file with default permissions rw-r--r-- (0644)
-        idx = fs_allocate_file_entry(filename, 0, PERM_OWNER_READ | PERM_OWNER_WRITE | PERM_GROUP_READ | PERM_OTHER_READ);
+        idx = fs_allocate_file_entry(filename, FS_TYPE_REGULAR,
+                PERM_OWNER_READ | PERM_OWNER_WRITE | PERM_GROUP_READ | PERM_OTHER_READ,
+                root_dir_index);
         if (idx < 0) {
             fprintf(stderr, "No free file entries available.\n");
             return -1;

@@ -13,6 +13,7 @@
 #include "../libfs/file_ops.h"
 #include "../libfs/user.h"
 #include "../libfs/viz.h"
+#include "../libfs/dir.h"
 
 // ------------ Stress Test Function ------------
 
@@ -308,7 +309,8 @@ static void print_help(void) {
     printf("  get_file_stats        - print size of current file\n");
     printf("  rm                    - delete current file (must be open)\n");
     printf("  close                 - close current file\n");
-    printf("  ls                    - list all files with permissions\n\n");
+    printf("  ls                    - list all files with permissions\n");
+    printf("  mkdir <name>          - create a directory in root\n\n");
 
     printf("User Management:\n");
     printf("  useradd <username>    - create a new user\n");
@@ -414,6 +416,16 @@ int main(void) {
             cmd_viz();
         } else if (strcmp(cmd, "stressTest") == 0) {
             stressTest();
+        } else if (strcmp(cmd, "mkdir") == 0) {
+            char *name = strtok(NULL, " \t");
+            if (!name) {
+                printf("Usage: mkdir <name>\n");
+                continue;
+            }
+            int idx = dir_mkdir(root_dir_index, name);
+            if (idx >= 0) {
+                printf("Directory '%s' created.\n", name);
+            }
         // User management commands
         } else if (strcmp(cmd, "useradd") == 0) {
             char *username = strtok(NULL, " \t");

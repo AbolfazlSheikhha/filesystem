@@ -2,7 +2,7 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -g
 
 LIBFS_SRC = libfs/fs_state.c libfs/disk_io.c libfs/bitmap.c \
-            libfs/file_ops.c libfs/user.c libfs/viz.c
+            libfs/file_ops.c libfs/user.c libfs/viz.c libfs/dir.c
 CLI_SRC   = cli/cli.c
 
 .PHONY: all clean
