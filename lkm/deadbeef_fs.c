@@ -329,7 +329,7 @@ static int deadbeef_rebuild_bitmap(struct super_block *sb)
 static int deadbeef_alloc_block(struct super_block *sb, u32 *out)
 {
 	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
-	struct deadbeef_disk_block blk;
+	struct deadbeef_disk_block *blk;
 	u32 w, b;
 
 	for (w = 0; w < sbi->bitmap_num_words; w++) {
@@ -341,9 +341,12 @@ static int deadbeef_alloc_block(struct super_block *sb, u32 *out)
 				return -ENOSPC;
 			if ((sbi->free_bitmap[w] >> b) & 1) {
 				deadbeef_bitmap_set_used(sbi, idx);
-				memset(&blk, 0, sizeof(blk));
-				blk.next_block = DEADBEEF_INVALID_BLOCK;
-				deadbeef_write_block(sb, idx, &blk);
+				blk = kzalloc(sizeof(*blk), GFP_KERNEL);
+				if (!blk)
+					return -ENOMEM;
+				blk->next_block = DEADBEEF_INVALID_BLOCK;
+				deadbeef_write_block(sb, idx, blk);
+				kfree(blk);
 				*out = idx;
 				return 0;
 			}
@@ -363,17 +366,25 @@ static void deadbeef_free_block(struct super_block *sb, u32 idx)
 /* Free an entire chain of blocks */
 static void deadbeef_free_chain(struct super_block *sb, u32 start)
 {
-	struct deadbeef_disk_block blk;
+	struct deadbeef_disk_block *blk;
 	u32 idx = start;
+
+	if (idx == DEADBEEF_INVALID_BLOCK)
+		return;
+
+	blk = kmalloc(sizeof(*blk), GFP_KERNEL);
+	if (!blk)
+		return;
 
 	while (idx != DEADBEEF_INVALID_BLOCK) {
 		u32 next;
-		if (deadbeef_read_block(sb, idx, &blk))
+		if (deadbeef_read_block(sb, idx, blk))
 			break;
-		next = blk.next_block;
+		next = blk->next_block;
 		deadbeef_free_block(sb, idx);
 		idx = next;
 	}
+	kfree(blk);
 }
 
 /* ================================================================
@@ -404,8 +415,17 @@ static void deadbeef_inode_init_once(void *obj)
 }
 
 /* ================================================================
- *  Forward declarations for operations (stubs for now)
+ *  Forward declarations for operations
  * ================================================================ */
+
+static struct dentry *deadbeef_lookup(struct inode *dir, struct dentry *dentry,
+				      unsigned int flags);
+static int deadbeef_create(struct mnt_idmap *idmap, struct inode *dir,
+			   struct dentry *dentry, umode_t mode, bool excl);
+static int deadbeef_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+			  struct dentry *dentry, umode_t mode);
+static int deadbeef_unlink(struct inode *dir, struct dentry *dentry);
+static int deadbeef_rmdir(struct inode *dir, struct dentry *dentry);
 
 static const struct inode_operations deadbeef_dir_iops;
 static const struct inode_operations deadbeef_file_iops;
@@ -463,11 +483,398 @@ static struct inode *deadbeef_iget(struct super_block *sb, int file_index)
 }
 
 /* ================================================================
- *  (Stub) operation tables — filled in parts 3.3–3.5
+ *  Directory helpers  (operate on file_table entries on disk)
+ * ================================================================ */
+
+/* Find entry by name inside a directory; returns file_table index or -1 */
+static int deadbeef_dir_find(struct super_block *sb, int dir_index,
+			     const char *name)
+{
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_disk_file *dir;
+	struct deadbeef_disk_block *blk;
+	u32 blk_idx;
+
+	if (dir_index < 0 || dir_index >= DEADBEEF_MAX_FILES)
+		return -1;
+	dir = &sbi->file_table[dir_index];
+	if (!dir->in_use || dir->type != DEADBEEF_TYPE_DIRECTORY)
+		return -1;
+
+	blk = kmalloc(sizeof(*blk), GFP_KERNEL);
+	if (!blk)
+		return -1;
+
+	blk_idx = dir->first_block;
+	while (blk_idx != DEADBEEF_INVALID_BLOCK) {
+		struct deadbeef_disk_dirent *de;
+		u32 i;
+		if (deadbeef_read_block(sb, blk_idx, blk))
+			break;
+		de = (struct deadbeef_disk_dirent *)blk->data;
+		for (i = 0; i < DEADBEEF_DIRENTS_PER_BLOCK; i++) {
+			if (de[i].file_index != DEADBEEF_INVALID_ENTRY &&
+			    strncmp(de[i].name, name,
+				    DEADBEEF_FILENAME_MAX) == 0) {
+				int ret = de[i].file_index;
+				kfree(blk);
+				return ret;
+			}
+		}
+		blk_idx = blk->next_block;
+	}
+	kfree(blk);
+	return -1;
+}
+
+/* Add (name → file_index) to a directory's data blocks */
+static int deadbeef_dir_add(struct super_block *sb, int dir_index,
+			    const char *name, int file_index)
+{
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_disk_file *dir;
+	struct deadbeef_disk_block *blk;
+	u32 blk_idx, prev_blk = DEADBEEF_INVALID_BLOCK;
+
+	if (dir_index < 0 || dir_index >= DEADBEEF_MAX_FILES)
+		return -EINVAL;
+	dir = &sbi->file_table[dir_index];
+	if (!dir->in_use || dir->type != DEADBEEF_TYPE_DIRECTORY)
+		return -ENOTDIR;
+	if (deadbeef_dir_find(sb, dir_index, name) >= 0)
+		return -EEXIST;
+
+	blk = kmalloc(sizeof(*blk), GFP_KERNEL);
+	if (!blk)
+		return -ENOMEM;
+
+	/* Scan existing blocks for free slot */
+	blk_idx = dir->first_block;
+	while (blk_idx != DEADBEEF_INVALID_BLOCK) {
+		struct deadbeef_disk_dirent *de;
+		u32 i;
+		if (deadbeef_read_block(sb, blk_idx, blk))
+			break;
+		de = (struct deadbeef_disk_dirent *)blk->data;
+		for (i = 0; i < DEADBEEF_DIRENTS_PER_BLOCK; i++) {
+			if (de[i].file_index == DEADBEEF_INVALID_ENTRY) {
+				memset(de[i].name, 0, DEADBEEF_FILENAME_MAX);
+				strncpy(de[i].name, name,
+					DEADBEEF_FILENAME_MAX - 1);
+				de[i].file_index = file_index;
+				deadbeef_write_block(sb, blk_idx, blk);
+				dir->size++;
+				deadbeef_sync_metadata(sb);
+				kfree(blk);
+				return 0;
+			}
+		}
+		prev_blk = blk_idx;
+		blk_idx = blk->next_block;
+	}
+
+	/* No free slot — allocate a new block */
+	{
+		u32 new_blk_idx;
+		struct deadbeef_disk_dirent *de;
+		u32 i;
+		int ret = deadbeef_alloc_block(sb, &new_blk_idx);
+		if (ret) {
+			kfree(blk);
+			return -ENOSPC;
+		}
+
+		if (deadbeef_read_block(sb, new_blk_idx, blk)) {
+			kfree(blk);
+			return -EIO;
+		}
+		de = (struct deadbeef_disk_dirent *)blk->data;
+		for (i = 0; i < DEADBEEF_DIRENTS_PER_BLOCK; i++) {
+			memset(de[i].name, 0, DEADBEEF_FILENAME_MAX);
+			de[i].file_index = DEADBEEF_INVALID_ENTRY;
+		}
+		strncpy(de[0].name, name, DEADBEEF_FILENAME_MAX - 1);
+		de[0].file_index = file_index;
+		blk->next_block = DEADBEEF_INVALID_BLOCK;
+		deadbeef_write_block(sb, new_blk_idx, blk);
+
+		if (dir->first_block == DEADBEEF_INVALID_BLOCK) {
+			dir->first_block = new_blk_idx;
+		} else {
+			struct deadbeef_disk_block *prev;
+			prev = kmalloc(sizeof(*prev), GFP_KERNEL);
+			if (!prev) {
+				kfree(blk);
+				return -ENOMEM;
+			}
+			if (deadbeef_read_block(sb, prev_blk, prev) == 0) {
+				prev->next_block = new_blk_idx;
+				deadbeef_write_block(sb, prev_blk, prev);
+			}
+			kfree(prev);
+		}
+
+		dir->size++;
+		deadbeef_sync_metadata(sb);
+	}
+	kfree(blk);
+	return 0;
+}
+
+/* Remove entry by name from a directory's data blocks */
+static int deadbeef_dir_remove(struct super_block *sb, int dir_index,
+			       const char *name)
+{
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_disk_file *dir;
+	struct deadbeef_disk_block *blk;
+	u32 blk_idx;
+
+	if (dir_index < 0 || dir_index >= DEADBEEF_MAX_FILES)
+		return -EINVAL;
+	dir = &sbi->file_table[dir_index];
+	if (!dir->in_use || dir->type != DEADBEEF_TYPE_DIRECTORY)
+		return -ENOTDIR;
+
+	blk = kmalloc(sizeof(*blk), GFP_KERNEL);
+	if (!blk)
+		return -ENOMEM;
+
+	blk_idx = dir->first_block;
+	while (blk_idx != DEADBEEF_INVALID_BLOCK) {
+		struct deadbeef_disk_dirent *de;
+		u32 i;
+		if (deadbeef_read_block(sb, blk_idx, blk))
+			break;
+		de = (struct deadbeef_disk_dirent *)blk->data;
+		for (i = 0; i < DEADBEEF_DIRENTS_PER_BLOCK; i++) {
+			if (de[i].file_index != DEADBEEF_INVALID_ENTRY &&
+			    strncmp(de[i].name, name,
+				    DEADBEEF_FILENAME_MAX) == 0) {
+				memset(de[i].name, 0, DEADBEEF_FILENAME_MAX);
+				de[i].file_index = DEADBEEF_INVALID_ENTRY;
+				deadbeef_write_block(sb, blk_idx, blk);
+				dir->size--;
+				deadbeef_sync_metadata(sb);
+				kfree(blk);
+				return 0;
+			}
+		}
+		blk_idx = blk->next_block;
+	}
+	kfree(blk);
+	return -ENOENT;
+}
+
+/* ================================================================
+ *  Inode operations: lookup, create, mkdir, unlink, rmdir
+ * ================================================================ */
+
+static struct dentry *deadbeef_lookup(struct inode *dir, struct dentry *dentry,
+				      unsigned int flags)
+{
+	struct super_block *sb = dir->i_sb;
+	struct deadbeef_inode_info *di = DEADBEEF_I(dir);
+	struct inode *inode = NULL;
+	int file_index;
+
+	if (dentry->d_name.len >= DEADBEEF_FILENAME_MAX)
+		return ERR_PTR(-ENAMETOOLONG);
+
+	file_index = deadbeef_dir_find(sb, di->file_index,
+				       dentry->d_name.name);
+	if (file_index >= 0) {
+		inode = deadbeef_iget(sb, file_index);
+		if (IS_ERR(inode))
+			return ERR_CAST(inode);
+	}
+	return d_splice_alias(inode, dentry);
+}
+
+static int deadbeef_create(struct mnt_idmap *idmap, struct inode *dir,
+			   struct dentry *dentry, umode_t mode, bool excl)
+{
+	struct super_block *sb = dir->i_sb;
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_inode_info *di = DEADBEEF_I(dir);
+	struct deadbeef_disk_file *fe;
+	struct inode *inode;
+	int slot, ret;
+
+	mutex_lock(&sbi->lock);
+	for (slot = 0; slot < DEADBEEF_MAX_FILES; slot++) {
+		if (!sbi->file_table[slot].in_use)
+			break;
+	}
+	if (slot >= DEADBEEF_MAX_FILES) {
+		mutex_unlock(&sbi->lock);
+		return -ENOSPC;
+	}
+
+	fe = &sbi->file_table[slot];
+	memset(fe, 0, sizeof(*fe));
+	strncpy(fe->name, dentry->d_name.name, DEADBEEF_FILENAME_MAX - 1);
+	fe->type        = DEADBEEF_TYPE_REGULAR;
+	fe->permissions = mode & 0777;
+	fe->size        = 0;
+	fe->first_block = DEADBEEF_INVALID_BLOCK;
+	fe->next_entry  = sbi->dsb.root_dir_head;
+	fe->owner_uid   = i_uid_read(dir);
+	fe->owner_gid   = i_gid_read(dir);
+	fe->in_use      = 1;
+	sbi->dsb.root_dir_head = slot;
+	sbi->dsb.num_files++;
+
+	ret = deadbeef_dir_add(sb, di->file_index,
+			       dentry->d_name.name, slot);
+	if (ret) {
+		fe->in_use = 0;
+		sbi->dsb.num_files--;
+		mutex_unlock(&sbi->lock);
+		return ret;
+	}
+	deadbeef_sync_metadata(sb);
+	mutex_unlock(&sbi->lock);
+
+	inode = deadbeef_iget(sb, slot);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+static int deadbeef_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+			  struct dentry *dentry, umode_t mode)
+{
+	struct super_block *sb = dir->i_sb;
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_inode_info *di = DEADBEEF_I(dir);
+	struct deadbeef_disk_file *fe;
+	struct inode *inode;
+	int slot, ret;
+
+	mutex_lock(&sbi->lock);
+	for (slot = 0; slot < DEADBEEF_MAX_FILES; slot++) {
+		if (!sbi->file_table[slot].in_use)
+			break;
+	}
+	if (slot >= DEADBEEF_MAX_FILES) {
+		mutex_unlock(&sbi->lock);
+		return -ENOSPC;
+	}
+
+	fe = &sbi->file_table[slot];
+	memset(fe, 0, sizeof(*fe));
+	strncpy(fe->name, dentry->d_name.name, DEADBEEF_FILENAME_MAX - 1);
+	fe->type        = DEADBEEF_TYPE_DIRECTORY;
+	fe->permissions = mode & 0777;
+	fe->size        = 0;
+	fe->first_block = DEADBEEF_INVALID_BLOCK;
+	fe->next_entry  = sbi->dsb.root_dir_head;
+	fe->owner_uid   = i_uid_read(dir);
+	fe->owner_gid   = i_gid_read(dir);
+	fe->in_use      = 1;
+	sbi->dsb.root_dir_head = slot;
+	sbi->dsb.num_files++;
+
+	ret = deadbeef_dir_add(sb, di->file_index,
+			       dentry->d_name.name, slot);
+	if (ret) {
+		fe->in_use = 0;
+		sbi->dsb.num_files--;
+		mutex_unlock(&sbi->lock);
+		return ret;
+	}
+	deadbeef_sync_metadata(sb);
+	inode_inc_link_count(dir);
+	mutex_unlock(&sbi->lock);
+
+	inode = deadbeef_iget(sb, slot);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+/* Helper: free all blocks and mark file_table entry unused */
+static void deadbeef_delete_entry(struct super_block *sb, int index)
+{
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_disk_file *fe = &sbi->file_table[index];
+	int prev;
+
+	deadbeef_free_chain(sb, fe->first_block);
+
+	/* Unlink from global file list */
+	if ((int)sbi->dsb.root_dir_head == index) {
+		sbi->dsb.root_dir_head = fe->next_entry;
+	} else {
+		prev = sbi->dsb.root_dir_head;
+		while (prev >= 0 && prev < DEADBEEF_MAX_FILES) {
+			if (sbi->file_table[prev].next_entry == index) {
+				sbi->file_table[prev].next_entry =
+					fe->next_entry;
+				break;
+			}
+			prev = sbi->file_table[prev].next_entry;
+		}
+	}
+
+	fe->in_use = 0;
+	sbi->dsb.num_files--;
+}
+
+static int deadbeef_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct super_block *sb = dir->i_sb;
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_inode_info *di_dir = DEADBEEF_I(dir);
+	struct inode *inode = d_inode(dentry);
+	struct deadbeef_inode_info *di = DEADBEEF_I(inode);
+
+	mutex_lock(&sbi->lock);
+	deadbeef_dir_remove(sb, di_dir->file_index, dentry->d_name.name);
+	deadbeef_delete_entry(sb, di->file_index);
+	deadbeef_sync_metadata(sb);
+	mutex_unlock(&sbi->lock);
+
+	inode_dec_link_count(inode);
+	return 0;
+}
+
+static int deadbeef_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	struct super_block *sb = dir->i_sb;
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_inode_info *di_dir = DEADBEEF_I(dir);
+	struct inode *inode = d_inode(dentry);
+	struct deadbeef_inode_info *di = DEADBEEF_I(inode);
+	struct deadbeef_disk_file *fe = &sbi->file_table[di->file_index];
+
+	if (fe->size > 0)
+		return -ENOTEMPTY;
+
+	mutex_lock(&sbi->lock);
+	deadbeef_dir_remove(sb, di_dir->file_index, dentry->d_name.name);
+	deadbeef_delete_entry(sb, di->file_index);
+	deadbeef_sync_metadata(sb);
+	inode_dec_link_count(dir);
+	mutex_unlock(&sbi->lock);
+
+	inode_dec_link_count(inode);
+	return 0;
+}
+
+/* ================================================================
+ *  Operation tables
  * ================================================================ */
 
 static const struct inode_operations deadbeef_dir_iops = {
-	/* lookup, create, mkdir, unlink, rmdir → part 3.3 */
+	.lookup = deadbeef_lookup,
+	.create = deadbeef_create,
+	.mkdir  = deadbeef_mkdir,
+	.unlink = deadbeef_unlink,
+	.rmdir  = deadbeef_rmdir,
 };
 
 static const struct inode_operations deadbeef_file_iops = {
