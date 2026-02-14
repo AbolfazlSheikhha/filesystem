@@ -514,3 +514,93 @@ int my_cp(const char *src_path, const char *dst_path) {
     printf("Copied '%s' -> '%s'.\n", abs_src, abs_dst);
     return 0;
 }
+
+int my_mv(const char *src_path, const char *dst_path) {
+    char abs_src[1024], abs_dst[1024];
+    make_absolute(src_path, abs_src, sizeof(abs_src));
+    make_absolute(dst_path, abs_dst, sizeof(abs_dst));
+
+    // Resolve source — need both the entry index and its parent
+    int src_parent;
+    char src_base[FS_FILENAME_MAX];
+    if (resolve_path_parent(abs_src, &src_parent, src_base) != 0) {
+        fprintf(stderr, "mv: cannot resolve '%s'.\n", abs_src);
+        return -1;
+    }
+    int src_idx = dir_find_entry(src_parent, src_base);
+    if (src_idx < 0) {
+        fprintf(stderr, "mv: source '%s' not found.\n", abs_src);
+        return -1;
+    }
+    FileEntry *src = &file_table[src_idx];
+
+    // Don't allow moving root directory
+    if (src_idx == root_dir_index) {
+        fprintf(stderr, "mv: cannot move root directory.\n");
+        return -1;
+    }
+
+    // Resolve destination
+    int dst_existing = resolve_path(abs_dst);
+    int dst_parent;
+    char dst_name[FS_FILENAME_MAX];
+
+    if (dst_existing >= 0 && file_table[dst_existing].type == FS_TYPE_DIRECTORY) {
+        // Move into directory, keep source basename
+        dst_parent = dst_existing;
+        // Prevent moving a directory into itself or a descendant
+        if (src->type == FS_TYPE_DIRECTORY) {
+            if (dst_parent == src_idx) {
+                fprintf(stderr, "mv: cannot move '%s' into itself.\n", abs_src);
+                return -1;
+            }
+            // Check if dst is a descendant of src (path prefix check)
+            size_t src_len = strlen(abs_src);
+            if (strncmp(abs_dst, abs_src, src_len) == 0 &&
+                (abs_dst[src_len] == '/' || abs_dst[src_len] == '\0')) {
+                fprintf(stderr, "mv: cannot move '%s' into its own subdirectory '%s'.\n",
+                        abs_src, abs_dst);
+                return -1;
+            }
+        }
+        strncpy(dst_name, src_base, FS_FILENAME_MAX - 1);
+        dst_name[FS_FILENAME_MAX - 1] = '\0';
+        if (dir_find_entry(dst_parent, dst_name) >= 0) {
+            fprintf(stderr, "mv: '%s/%s' already exists.\n", abs_dst, dst_name);
+            return -1;
+        }
+    } else if (dst_existing >= 0) {
+        fprintf(stderr, "mv: destination '%s' already exists.\n", abs_dst);
+        return -1;
+    } else {
+        // Destination doesn't exist — treat as rename/move
+        if (resolve_path_parent(abs_dst, &dst_parent, dst_name) != 0) {
+            fprintf(stderr, "mv: cannot resolve parent of '%s'.\n", abs_dst);
+            return -1;
+        }
+    }
+
+    // Remove dirent from source parent
+    if (dir_remove_entry(src_parent, src_base) != 0) {
+        fprintf(stderr, "mv: failed to remove source entry.\n");
+        return -1;
+    }
+
+    // Add dirent to destination parent
+    if (dir_add_entry(dst_parent, dst_name, src_idx) != 0) {
+        // Rollback: re-add to source parent
+        dir_add_entry(src_parent, src_base, src_idx);
+        fprintf(stderr, "mv: failed to add destination entry.\n");
+        return -1;
+    }
+
+    // Update filename in file_table if name changed
+    if (strncmp(src->name, dst_name, FS_FILENAME_MAX) != 0) {
+        memset(src->name, 0, FS_FILENAME_MAX);
+        strncpy(src->name, dst_name, FS_FILENAME_MAX - 1);
+    }
+
+    fs_sync_metadata();
+    printf("Moved '%s' -> '%s'.\n", abs_src, abs_dst);
+    return 0;
+}

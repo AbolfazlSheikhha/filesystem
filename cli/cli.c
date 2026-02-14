@@ -309,6 +309,7 @@ static void print_help(void) {
     printf("  get_file_stats        - print size of current file\n");
     printf("  rm                    - delete current file (must be open)\n");
     printf("  cp <src> <dst>        - copy a file\n");
+    printf("  mv <src> <dst>        - move/rename a file or directory\n");
     printf("  close                 - close current file\n");
     printf("  ls [path]             - list directory contents (default: cwd)\n");
     printf("  mkdir <path>          - create a directory (e.g. /sub/dir)\n");
@@ -417,6 +418,14 @@ int main(void) {
                 continue;
             }
             my_cp(src, dst);
+        } else if (strcmp(cmd, "mv") == 0) {
+            char *src = strtok(NULL, " \t");
+            char *dst = strtok(NULL, " \t");
+            if (!src || !dst) {
+                printf("Usage: mv <source> <destination>\n");
+                continue;
+            }
+            my_mv(src, dst);
         } else if (strcmp(cmd, "close") == 0) {
             my_close();
         } else if (strcmp(cmd, "ls") == 0) {
