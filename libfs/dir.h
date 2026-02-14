@@ -28,4 +28,9 @@ int resolve_path(const char *path);
 // Returns 0 on success, -1 on failure.
 int resolve_path_parent(const char *path, int *parent_out, char *basename_out);
 
+// Build an absolute path from a user-supplied path.
+// If path starts with '/', it is absolute; otherwise it is joined with cwd_path.
+// Result is written to abs_out (must be >= 1024 bytes).
+void make_absolute(const char *path, char *abs_out, size_t abs_size);
+
 #endif /* DIR_H */

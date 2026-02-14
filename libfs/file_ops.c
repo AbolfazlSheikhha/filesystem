@@ -156,14 +156,9 @@ int my_open(const char *path, uint32_t flags) {
         return -1;
     }
 
-    // If bare name (no '/'), treat as /name (relative to root for now)
+    // Build absolute path from cwd if relative
     char abs_path[1024];
-    if (path[0] != '/') {
-        snprintf(abs_path, sizeof(abs_path), "/%s", path);
-    } else {
-        strncpy(abs_path, path, sizeof(abs_path) - 1);
-        abs_path[sizeof(abs_path) - 1] = '\0';
-    }
+    make_absolute(path, abs_path, sizeof(abs_path));
 
     // Try to resolve the full path first
     int idx = resolve_path(abs_path);

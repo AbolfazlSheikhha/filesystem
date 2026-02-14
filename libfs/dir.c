@@ -286,3 +286,20 @@ int resolve_path_parent(const char *path, int *parent_out, char *basename_out) {
     *parent_out = parent;
     return 0;
 }
+
+// ------------ Absolute Path Builder ------------
+
+void make_absolute(const char *path, char *abs_out, size_t abs_size) {
+    if (path[0] == '/') {
+        // Already absolute
+        strncpy(abs_out, path, abs_size - 1);
+        abs_out[abs_size - 1] = '\0';
+    } else {
+        // Join cwd_path + "/" + path
+        if (strcmp(cwd_path, "/") == 0) {
+            snprintf(abs_out, abs_size, "/%s", path);
+        } else {
+            snprintf(abs_out, abs_size, "%s/%s", cwd_path, path);
+        }
+    }
+}

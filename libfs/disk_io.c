@@ -83,6 +83,9 @@ void fs_load_metadata(void) {
     if (root_dir_index < 0) {
         fprintf(stderr, "Warning: root directory not found in filesystem.\n");
     }
+    // cwd defaults to root
+    cwd_index = root_dir_index;
+    strncpy(cwd_path, "/", sizeof(cwd_path));
 }
 
 // Format a brand-new filesystem in filesys.db
@@ -139,6 +142,8 @@ void fs_format_new(void) {
     sb.root_dir_head = 0;
     sb.num_files = 1;
     root_dir_index = 0;
+    cwd_index = 0;
+    strncpy(cwd_path, "/", sizeof(cwd_path));
 
     fs_sync_metadata();
 

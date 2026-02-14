@@ -23,6 +23,10 @@ extern uint32_t current_file_flags;
 // Root directory file_table index
 extern int root_dir_index;
 
+// Current working directory
+extern int cwd_index;            // file_table index of cwd
+extern char cwd_path[1024];      // display string, e.g. "/docs/reports"
+
 // Free space bitmap
 extern uint64_t free_bitmap[BITMAP_MAX_WORDS];
 extern uint32_t bitmap_num_words;

@@ -16,5 +16,8 @@ uint32_t current_file_flags = 0;
 
 int root_dir_index = -1;
 
+int cwd_index = -1;
+char cwd_path[1024] = "/";
+
 uint64_t free_bitmap[BITMAP_MAX_WORDS];
 uint32_t bitmap_num_words = 0;

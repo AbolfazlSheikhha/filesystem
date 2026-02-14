@@ -310,7 +310,9 @@ static void print_help(void) {
     printf("  rm                    - delete current file (must be open)\n");
     printf("  close                 - close current file\n");
     printf("  ls                    - list all files with permissions\n");
-    printf("  mkdir <path>          - create a directory (e.g. /sub/dir)\n\n");
+    printf("  mkdir <path>          - create a directory (e.g. /sub/dir)\n");
+    printf("  cd [path]             - change directory (no arg = root)\n");
+    printf("  pwd                   - print working directory\n\n");
 
     printf("User Management:\n");
     printf("  useradd <username>    - create a new user\n");
@@ -347,7 +349,7 @@ int main(void) {
 
     char line[512];
     while (1) {
-        printf("%s@fs> ", fs_get_username(current_uid));
+        printf("%s@fs:%s> ", fs_get_username(current_uid), cwd_path);
         fflush(stdout);
         if (!fgets(line, sizeof(line), stdin)) break;
 
@@ -410,6 +412,8 @@ int main(void) {
             my_close();
         } else if (strcmp(cmd, "ls") == 0) {
             cmd_ls();
+        } else if (strcmp(cmd, "pwd") == 0) {
+            printf("%s\n", cwd_path);
         } else if (strcmp(cmd, "get_fs_stats") == 0) {
             my_get_fs_stats();
         } else if (strcmp(cmd, "viz") == 0) {
@@ -422,14 +426,8 @@ int main(void) {
                 printf("Usage: mkdir <path>\n");
                 continue;
             }
-            // If bare name, treat as /name
             char abs_path[1024];
-            if (path[0] != '/') {
-                snprintf(abs_path, sizeof(abs_path), "/%s", path);
-            } else {
-                strncpy(abs_path, path, sizeof(abs_path) - 1);
-                abs_path[sizeof(abs_path) - 1] = '\0';
-            }
+            make_absolute(path, abs_path, sizeof(abs_path));
             int parent_dir;
             char basename[FS_FILENAME_MAX];
             if (resolve_path_parent(abs_path, &parent_dir, basename) != 0) {
@@ -440,6 +438,28 @@ int main(void) {
             if (idx >= 0) {
                 printf("Directory '%s' created.\n", abs_path);
             }
+        } else if (strcmp(cmd, "cd") == 0) {
+            char *path = strtok(NULL, " \t");
+            if (!path) {
+                // cd with no arg → go to root
+                cwd_index = root_dir_index;
+                strncpy(cwd_path, "/", sizeof(cwd_path));
+                continue;
+            }
+            char abs_path[1024];
+            make_absolute(path, abs_path, sizeof(abs_path));
+            int target = resolve_path(abs_path);
+            if (target < 0) {
+                fprintf(stderr, "cd: '%s' not found.\n", abs_path);
+                continue;
+            }
+            if (file_table[target].type != FS_TYPE_DIRECTORY) {
+                fprintf(stderr, "cd: '%s' is not a directory.\n", abs_path);
+                continue;
+            }
+            cwd_index = target;
+            strncpy(cwd_path, abs_path, sizeof(cwd_path) - 1);
+            cwd_path[sizeof(cwd_path) - 1] = '\0';
         // User management commands
         } else if (strcmp(cmd, "useradd") == 0) {
             char *username = strtok(NULL, " \t");
