@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+modules.order
+Module.symvers
+
+# Binaries
+deadbeef_cli
+mkfs.deadbeef
+
+# Disk image
+filesys.db
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
