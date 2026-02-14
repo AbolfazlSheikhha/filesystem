@@ -123,6 +123,9 @@ struct deadbeef_sb_info {
 struct deadbeef_inode_info {
 	int                 file_index;   /* index into file_table */
 	struct rw_semaphore  data_rwsem;   /* per-file concurrent access */
+	u32                 *block_map;    /* cached logical→physical map */
+	u32                  bmap_cap;     /* allocated entries */
+	u32                  bmap_len;     /* used entries */
 	struct inode         vfs_inode;
 };
 
@@ -408,7 +411,10 @@ static struct inode *deadbeef_alloc_inode(struct super_block *sb)
 
 static void deadbeef_free_inode(struct inode *inode)
 {
-	kmem_cache_free(deadbeef_inode_cachep, DEADBEEF_I(inode));
+	struct deadbeef_inode_info *di = DEADBEEF_I(inode);
+	kvfree(di->block_map);
+	di->block_map = NULL;
+	kmem_cache_free(deadbeef_inode_cachep, di);
 }
 
 static void deadbeef_inode_init_once(void *obj)
@@ -436,6 +442,96 @@ static const struct file_operations  deadbeef_dir_fops;
 static const struct file_operations  deadbeef_file_fops;
 
 /* ================================================================
+ *  Block map helpers — O(1) logical-to-physical block lookup
+ *
+ *  We walk the on-disk linked list once and cache the mapping in a
+ *  per-inode array.  Subsequent accesses use direct indexing.
+ * ================================================================ */
+
+/* Build the block_map for a file.  Caller must NOT hold meta_rwsem. */
+static int deadbeef_build_block_map(struct super_block *sb,
+				    struct deadbeef_inode_info *di)
+{
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_disk_file *fe = &sbi->file_table[di->file_index];
+	struct deadbeef_disk_block *blk;
+	u32 idx, n = 0, cap;
+
+	if (fe->first_block == DEADBEEF_INVALID_BLOCK) {
+		di->block_map = NULL;
+		di->bmap_cap  = 0;
+		di->bmap_len  = 0;
+		return 0;
+	}
+
+	/* Initial capacity: estimate from size */
+	cap = (fe->size + DEADBEEF_BLOCK_DATA_SIZE - 1) / DEADBEEF_BLOCK_DATA_SIZE;
+	if (cap < 4)
+		cap = 4;
+
+	di->block_map = kvmalloc_array(cap, sizeof(u32), GFP_KERNEL);
+	if (!di->block_map)
+		return -ENOMEM;
+
+	blk = kmalloc(sizeof(*blk), GFP_KERNEL);
+	if (!blk) {
+		kvfree(di->block_map);
+		di->block_map = NULL;
+		return -ENOMEM;
+	}
+
+	idx = fe->first_block;
+	while (idx != DEADBEEF_INVALID_BLOCK) {
+		if (n >= cap) {
+			u32 *tmp;
+			cap *= 2;
+			tmp = kvmalloc_array(cap, sizeof(u32), GFP_KERNEL);
+			if (!tmp) {
+				kfree(blk);
+				kvfree(di->block_map);
+				di->block_map = NULL;
+				return -ENOMEM;
+			}
+			memcpy(tmp, di->block_map, n * sizeof(u32));
+			kvfree(di->block_map);
+			di->block_map = tmp;
+		}
+		di->block_map[n++] = idx;
+		if (deadbeef_read_block(sb, idx, blk)) {
+			kfree(blk);
+			kvfree(di->block_map);
+			di->block_map = NULL;
+			return -EIO;
+		}
+		idx = blk->next_block;
+	}
+
+	kfree(blk);
+	di->bmap_cap = cap;
+	di->bmap_len = n;
+	return 0;
+}
+
+/* Append a newly allocated block to the map. */
+static int deadbeef_bmap_append(struct deadbeef_inode_info *di, u32 blk_idx)
+{
+	if (di->bmap_len >= di->bmap_cap) {
+		u32 new_cap = di->bmap_cap ? di->bmap_cap * 2 : 4;
+		u32 *tmp = kvmalloc_array(new_cap, sizeof(u32), GFP_KERNEL);
+		if (!tmp)
+			return -ENOMEM;
+		if (di->block_map) {
+			memcpy(tmp, di->block_map, di->bmap_len * sizeof(u32));
+			kvfree(di->block_map);
+		}
+		di->block_map = tmp;
+		di->bmap_cap = new_cap;
+	}
+	di->block_map[di->bmap_len++] = blk_idx;
+	return 0;
+}
+
+/* ================================================================
  *  deadbeef_iget — build a VFS inode from a file_table entry
  * ================================================================ */
 
@@ -461,6 +557,9 @@ static struct inode *deadbeef_iget(struct super_block *sb, int file_index)
 	di = DEADBEEF_I(inode);
 	di->file_index = file_index;
 	init_rwsem(&di->data_rwsem);
+	di->block_map = NULL;
+	di->bmap_cap  = 0;
+	di->bmap_len  = 0;
 
 	inode->i_ino = deadbeef_ino(file_index);
 	i_uid_write(inode, fe->owner_uid);
@@ -480,6 +579,12 @@ static struct inode *deadbeef_iget(struct super_block *sb, int file_index)
 		inode->i_op   = &deadbeef_file_iops;
 		inode->i_fop  = &deadbeef_file_fops;
 		set_nlink(inode, 1);
+	}
+
+	/* Build block map for O(1) block lookup */
+	if (deadbeef_build_block_map(sb, di)) {
+		iget_failed(inode);
+		return ERR_PTR(-EIO);
 	}
 
 	unlock_new_inode(inode);
@@ -533,7 +638,8 @@ static int deadbeef_dir_find(struct super_block *sb, int dir_index,
 
 /* Add (name → file_index) to a directory's data blocks */
 static int deadbeef_dir_add(struct super_block *sb, int dir_index,
-			    const char *name, int file_index)
+			    const char *name, int file_index,
+			    struct deadbeef_inode_info *dir_di)
 {
 	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
 	struct deadbeef_disk_file *dir;
@@ -617,6 +723,10 @@ static int deadbeef_dir_add(struct super_block *sb, int dir_index,
 			}
 			kfree(prev);
 		}
+
+		/* Update directory block map */
+		if (dir_di)
+			deadbeef_bmap_append(dir_di, new_blk_idx);
 
 		dir->size++;
 		deadbeef_sync_metadata(sb);
@@ -730,7 +840,7 @@ static int deadbeef_create(struct mnt_idmap *idmap, struct inode *dir,
 	sbi->dsb.num_files++;
 
 	ret = deadbeef_dir_add(sb, di->file_index,
-			       dentry->d_name.name, slot);
+			       dentry->d_name.name, slot, di);
 	if (ret) {
 		fe->in_use = 0;
 		sbi->dsb.num_files--;
@@ -782,7 +892,7 @@ static int deadbeef_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	sbi->dsb.num_files++;
 
 	ret = deadbeef_dir_add(sb, di->file_index,
-			       dentry->d_name.name, slot);
+			       dentry->d_name.name, slot, di);
 	if (ret) {
 		fe->in_use = 0;
 		sbi->dsb.num_files--;
@@ -873,40 +983,32 @@ static int deadbeef_rmdir(struct inode *dir, struct dentry *dentry)
  *  File operations: read_iter, write_iter
  * ================================================================ */
 
-/* Ensure a file has enough allocated blocks for required_size bytes */
+/* Ensure a file has enough allocated blocks for required_size bytes.
+ * Uses and updates the block map for O(1) chain-end lookup. */
 static int deadbeef_ensure_capacity(struct super_block *sb,
+				    struct deadbeef_inode_info *di,
 				    struct deadbeef_disk_file *fe,
 				    u32 required_size)
 {
 	u32 data_per_block = DEADBEEF_BLOCK_DATA_SIZE;
-	u32 count = 0, last = DEADBEEF_INVALID_BLOCK, idx;
-	u64 current_cap, additional;
-	u32 blocks_to_add, i;
+	u64 current_cap;
+	u32 blocks_to_add, i, last;
+	u64 additional;
 	struct deadbeef_disk_block *blk;
+
+	current_cap = (u64)di->bmap_len * data_per_block;
+	if (current_cap >= required_size)
+		return 0;
+
+	additional = required_size - current_cap;
+	blocks_to_add = (u32)((additional + data_per_block - 1) / data_per_block);
 
 	blk = kmalloc(sizeof(*blk), GFP_KERNEL);
 	if (!blk)
 		return -ENOMEM;
 
-	idx = fe->first_block;
-	while (idx != DEADBEEF_INVALID_BLOCK) {
-		if (deadbeef_read_block(sb, idx, blk)) {
-			kfree(blk);
-			return -EIO;
-		}
-		last = idx;
-		idx = blk->next_block;
-		count++;
-	}
-
-	current_cap = (u64)count * data_per_block;
-	if (current_cap >= required_size) {
-		kfree(blk);
-		return 0;
-	}
-
-	additional = required_size - current_cap;
-	blocks_to_add = (u32)((additional + data_per_block - 1) / data_per_block);
+	last = di->bmap_len > 0 ? di->block_map[di->bmap_len - 1]
+				: DEADBEEF_INVALID_BLOCK;
 
 	for (i = 0; i < blocks_to_add; i++) {
 		u32 new_idx;
@@ -927,6 +1029,12 @@ static int deadbeef_ensure_capacity(struct super_block *sb,
 			deadbeef_write_block(sb, last, blk);
 		}
 		last = new_idx;
+
+		ret = deadbeef_bmap_append(di, new_idx);
+		if (ret) {
+			kfree(blk);
+			return ret;
+		}
 	}
 
 	kfree(blk);
@@ -944,9 +1052,8 @@ static ssize_t deadbeef_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	loff_t pos = iocb->ki_pos;
 	size_t count = iov_iter_count(to);
 	u32 data_per_block = DEADBEEF_BLOCK_DATA_SIZE;
-	u32 blk_in_file, off_in_blk, idx;
+	u32 blk_in_file, off_in_blk;
 	size_t total = 0;
-	u32 i;
 
 	if (pos >= fe->size)
 		return 0;
@@ -964,21 +1071,11 @@ static ssize_t deadbeef_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 	blk_in_file = (u32)pos / data_per_block;
 	off_in_blk  = (u32)pos % data_per_block;
-	idx = fe->first_block;
 
-	/* Skip to the right block */
-	for (i = 0; i < blk_in_file && idx != DEADBEEF_INVALID_BLOCK; i++) {
-		if (deadbeef_read_block(sb, idx, blk)) {
-			up_read(&di->data_rwsem);
-			up_read(&sbi->meta_rwsem);
-			kfree(blk);
-			return -EIO;
-		}
-		idx = blk->next_block;
-	}
-
-	while (count > 0 && idx != DEADBEEF_INVALID_BLOCK) {
+	while (count > 0 && blk_in_file < di->bmap_len) {
 		size_t chunk, copied;
+		u32 idx = di->block_map[blk_in_file];
+
 		if (deadbeef_read_block(sb, idx, blk)) {
 			up_read(&di->data_rwsem);
 			up_read(&sbi->meta_rwsem);
@@ -994,7 +1091,7 @@ static ssize_t deadbeef_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		if (copied < chunk)
 			break;
 		off_in_blk = 0;
-		idx = blk->next_block;
+		blk_in_file++;
 	}
 
 	up_read(&di->data_rwsem);
@@ -1015,9 +1112,8 @@ static ssize_t deadbeef_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	loff_t pos;
 	size_t count = iov_iter_count(from);
 	u32 data_per_block = DEADBEEF_BLOCK_DATA_SIZE;
-	u32 required, blk_in_file, off_in_blk, idx;
+	u32 required, blk_in_file, off_in_blk;
 	size_t total = 0;
-	u32 i;
 	int ret;
 
 	if (count == 0)
@@ -1036,7 +1132,7 @@ static ssize_t deadbeef_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	pos = iocb->ki_pos;
 
 	required = (u32)(pos + count);
-	ret = deadbeef_ensure_capacity(sb, fe, required);
+	ret = deadbeef_ensure_capacity(sb, di, fe, required);
 	if (ret) {
 		up_write(&di->data_rwsem);
 		up_write(&sbi->meta_rwsem);
@@ -1046,20 +1142,11 @@ static ssize_t deadbeef_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	blk_in_file = (u32)pos / data_per_block;
 	off_in_blk  = (u32)pos % data_per_block;
-	idx = fe->first_block;
 
-	for (i = 0; i < blk_in_file && idx != DEADBEEF_INVALID_BLOCK; i++) {
-		if (deadbeef_read_block(sb, idx, blk)) {
-			up_write(&di->data_rwsem);
-			up_write(&sbi->meta_rwsem);
-			kfree(blk);
-			return -EIO;
-		}
-		idx = blk->next_block;
-	}
-
-	while (count > 0 && idx != DEADBEEF_INVALID_BLOCK) {
+	while (count > 0 && blk_in_file < di->bmap_len) {
 		size_t chunk, copied;
+		u32 idx = di->block_map[blk_in_file];
+
 		if (deadbeef_read_block(sb, idx, blk)) {
 			up_write(&di->data_rwsem);
 			up_write(&sbi->meta_rwsem);
@@ -1077,7 +1164,7 @@ static ssize_t deadbeef_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if (copied < chunk)
 			break;
 		off_in_blk = 0;
-		idx = blk->next_block;
+		blk_in_file++;
 	}
 
 	if ((u32)(pos + total) > fe->size)
@@ -1102,10 +1189,8 @@ static int deadbeef_iterate(struct file *filp, struct dir_context *ctx)
 	struct super_block *sb = inode->i_sb;
 	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
 	struct deadbeef_inode_info *di = DEADBEEF_I(inode);
-	struct deadbeef_disk_file *dir_fe = &sbi->file_table[di->file_index];
 	struct deadbeef_disk_block *blk;
-	u32 blk_idx;
-	u32 slot = 0;
+	u32 b, slot = 0;
 
 	/* Emit . and .. */
 	if (!dir_emit_dots(filp, ctx))
@@ -1117,13 +1202,12 @@ static int deadbeef_iterate(struct file *filp, struct dir_context *ctx)
 
 	down_read(&sbi->meta_rwsem);
 	down_read(&di->data_rwsem);
-	blk_idx = dir_fe->first_block;
 
-	while (blk_idx != DEADBEEF_INVALID_BLOCK) {
+	for (b = 0; b < di->bmap_len; b++) {
 		struct deadbeef_disk_dirent *de;
 		u32 i;
 
-		if (deadbeef_read_block(sb, blk_idx, blk))
+		if (deadbeef_read_block(sb, di->block_map[b], blk))
 			break;
 		de = (struct deadbeef_disk_dirent *)blk->data;
 
@@ -1134,7 +1218,6 @@ static int deadbeef_iterate(struct file *filp, struct dir_context *ctx)
 			if (de[i].file_index == DEADBEEF_INVALID_ENTRY)
 				continue;
 
-			/* Skip entries already past ctx->pos */
 			if (slot + 2 < ctx->pos)
 				continue;
 
@@ -1158,7 +1241,6 @@ static int deadbeef_iterate(struct file *filp, struct dir_context *ctx)
 			}
 			ctx->pos = slot + 3;
 		}
-		blk_idx = blk->next_block;
 	}
 
 	up_read(&di->data_rwsem);
@@ -1173,55 +1255,50 @@ static int deadbeef_iterate(struct file *filp, struct dir_context *ctx)
 
 /* Truncate a file to new_size.  Caller holds meta_rwsem exclusive. */
 static int deadbeef_truncate(struct super_block *sb,
+			     struct deadbeef_inode_info *di,
 			     struct deadbeef_disk_file *fe,
 			     u32 new_size)
 {
 	u32 data_per_block = DEADBEEF_BLOCK_DATA_SIZE;
 
 	if (new_size > fe->size) {
-		/* Growing — allocate more blocks and zero-fill */
-		int ret = deadbeef_ensure_capacity(sb, fe, new_size);
+		/* Growing — allocate more blocks */
+		int ret = deadbeef_ensure_capacity(sb, di, fe, new_size);
 		if (ret)
 			return ret;
 	} else if (new_size == 0) {
 		/* Truncate to zero — free all blocks */
 		deadbeef_free_chain(sb, fe->first_block);
 		fe->first_block = DEADBEEF_INVALID_BLOCK;
+		di->bmap_len = 0;
 	} else {
-		/* Shrinking — keep only the needed blocks, free the rest */
+		/* Shrinking — keep the needed blocks, free the rest */
 		u32 keep_blocks = (new_size + data_per_block - 1) / data_per_block;
-		u32 blk_idx = fe->first_block, prev = DEADBEEF_INVALID_BLOCK;
-		u32 i;
-		struct deadbeef_disk_block *blk;
 
-		blk = kmalloc(sizeof(*blk), GFP_KERNEL);
-		if (!blk)
-			return -ENOMEM;
+		if (keep_blocks < di->bmap_len) {
+			u32 last_kept = di->block_map[keep_blocks - 1];
+			u32 free_from = (keep_blocks < di->bmap_len)
+					? di->block_map[keep_blocks]
+					: DEADBEEF_INVALID_BLOCK;
+			struct deadbeef_disk_block *blk;
 
-		for (i = 0; i < keep_blocks; i++) {
-			if (blk_idx == DEADBEEF_INVALID_BLOCK)
-				break;
-			if (deadbeef_read_block(sb, blk_idx, blk)) {
-				kfree(blk);
-				return -EIO;
-			}
-			prev = blk_idx;
-			blk_idx = blk->next_block;
-		}
+			blk = kmalloc(sizeof(*blk), GFP_KERNEL);
+			if (!blk)
+				return -ENOMEM;
 
-		/* Sever the chain after the last kept block */
-		if (prev != DEADBEEF_INVALID_BLOCK) {
-			if (deadbeef_read_block(sb, prev, blk)) {
+			/* Sever the chain */
+			if (deadbeef_read_block(sb, last_kept, blk)) {
 				kfree(blk);
 				return -EIO;
 			}
 			blk->next_block = DEADBEEF_INVALID_BLOCK;
-			deadbeef_write_block(sb, prev, blk);
-		}
+			deadbeef_write_block(sb, last_kept, blk);
+			kfree(blk);
 
-		/* Free everything after */
-		deadbeef_free_chain(sb, blk_idx);
-		kfree(blk);
+			/* Free remainder */
+			deadbeef_free_chain(sb, free_from);
+			di->bmap_len = keep_blocks;
+		}
 	}
 
 	fe->size = new_size;
@@ -1247,7 +1324,7 @@ static int deadbeef_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	if (attr->ia_valid & ATTR_SIZE) {
 		down_write(&di->data_rwsem);
-		ret = deadbeef_truncate(sb, fe, (u32)attr->ia_size);
+		ret = deadbeef_truncate(sb, di, fe, (u32)attr->ia_size);
 		if (ret) {
 			up_write(&di->data_rwsem);
 			up_write(&sbi->meta_rwsem);
