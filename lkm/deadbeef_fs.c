@@ -1080,6 +1080,78 @@ static ssize_t deadbeef_write_iter(struct kiocb *iocb, struct iov_iter *from)
 }
 
 /* ================================================================
+ *  Directory file operations: iterate_shared (readdir / ls)
+ * ================================================================ */
+
+static int deadbeef_iterate(struct file *filp, struct dir_context *ctx)
+{
+	struct inode *inode = file_inode(filp);
+	struct super_block *sb = inode->i_sb;
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_inode_info *di = DEADBEEF_I(inode);
+	struct deadbeef_disk_file *dir_fe = &sbi->file_table[di->file_index];
+	struct deadbeef_disk_block *blk;
+	u32 blk_idx;
+	u32 slot = 0;
+
+	/* Emit . and .. */
+	if (!dir_emit_dots(filp, ctx))
+		return 0;
+
+	blk = kmalloc(sizeof(*blk), GFP_KERNEL);
+	if (!blk)
+		return -ENOMEM;
+
+	mutex_lock(&sbi->lock);
+	blk_idx = dir_fe->first_block;
+
+	while (blk_idx != DEADBEEF_INVALID_BLOCK) {
+		struct deadbeef_disk_dirent *de;
+		u32 i;
+
+		if (deadbeef_read_block(sb, blk_idx, blk))
+			break;
+		de = (struct deadbeef_disk_dirent *)blk->data;
+
+		for (i = 0; i < DEADBEEF_DIRENTS_PER_BLOCK; i++, slot++) {
+			int fidx;
+			unsigned char dtype;
+
+			if (de[i].file_index == DEADBEEF_INVALID_ENTRY)
+				continue;
+
+			/* Skip entries already past ctx->pos */
+			if (slot + 2 < ctx->pos)
+				continue;
+
+			fidx = de[i].file_index;
+			dtype = DT_UNKNOWN;
+			if (fidx >= 0 && fidx < DEADBEEF_MAX_FILES &&
+			    sbi->file_table[fidx].in_use) {
+				dtype = (sbi->file_table[fidx].type ==
+					 DEADBEEF_TYPE_DIRECTORY)
+					? DT_DIR : DT_REG;
+			}
+
+			if (!dir_emit(ctx, de[i].name,
+				      strnlen(de[i].name,
+					      DEADBEEF_FILENAME_MAX),
+				      deadbeef_ino(fidx), dtype)) {
+				mutex_unlock(&sbi->lock);
+				kfree(blk);
+				return 0;
+			}
+			ctx->pos = slot + 3;
+		}
+		blk_idx = blk->next_block;
+	}
+
+	mutex_unlock(&sbi->lock);
+	kfree(blk);
+	return 0;
+}
+
+/* ================================================================
  *  Operation tables
  * ================================================================ */
 
@@ -1097,16 +1169,16 @@ static const struct inode_operations deadbeef_file_iops = {
 };
 
 static const struct file_operations deadbeef_dir_fops = {
-	.owner  = THIS_MODULE,
-	.llseek = generic_file_llseek,
-	.read   = generic_read_dir,
-	/* iterate_shared → part 3.5 */
+	.owner          = THIS_MODULE,
+	.llseek         = generic_file_llseek,
+	.read           = generic_read_dir,
+	.iterate_shared = deadbeef_iterate,
 };
 
 static const struct file_operations deadbeef_file_fops = {
-	.owner     = THIS_MODULE,
-	.llseek    = generic_file_llseek,
-	.read_iter = deadbeef_read_iter,
+	.owner      = THIS_MODULE,
+	.llseek     = generic_file_llseek,
+	.read_iter  = deadbeef_read_iter,
 	.write_iter = deadbeef_write_iter,
 };
 
