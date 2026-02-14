@@ -62,6 +62,16 @@ typedef struct {
     uint8_t  data[BLOCK_DATA_SIZE];
 } BlockOnDisk;
 
+// Directory entry stored inside a directory's data blocks.
+// A directory's data is simply an array of these entries.
+typedef struct {
+    char     name[FS_FILENAME_MAX]; // null-terminated entry name
+    int32_t  file_index;            // index into file_table, or FS_INVALID_ENTRY if slot is free
+} DirEntry;
+
+// How many DirEntry structs fit in one block's data area
+#define DIRENTS_PER_BLOCK  (BLOCK_DATA_SIZE / sizeof(DirEntry))
+
 #pragma pack(pop)
 
 #endif /* FS_TYPES_H */

@@ -70,6 +70,19 @@ void fs_load_metadata(void) {
 
     // Reconstruct freelist from the file usage map
     fs_rebuild_freelist();
+
+    // Locate root directory in file_table
+    root_dir_index = -1;
+    for (int i = 0; i < FS_MAX_FILES; ++i) {
+        if (file_table[i].in_use && file_table[i].type == FS_TYPE_DIRECTORY &&
+            strcmp(file_table[i].name, "/") == 0) {
+            root_dir_index = i;
+            break;
+        }
+    }
+    if (root_dir_index < 0) {
+        fprintf(stderr, "Warning: root directory not found in filesystem.\n");
+    }
 }
 
 // Format a brand-new filesystem in filesys.db
@@ -108,9 +121,28 @@ void fs_format_new(void) {
     // Initialize bitmap - all blocks are free on a fresh format
     bitmap_init_all_free();
 
+    // Create root directory "/" as file_table[0]
+    FileEntry *root = &file_table[0];
+    memset(root, 0, sizeof(*root));
+    strncpy(root->name, "/", FS_FILENAME_MAX - 1);
+    root->type = FS_TYPE_DIRECTORY;
+    root->permissions = PERM_OWNER_READ | PERM_OWNER_WRITE | PERM_OWNER_EXEC |
+                        PERM_GROUP_READ | PERM_GROUP_EXEC |
+                        PERM_OTHER_READ | PERM_OTHER_EXEC;  // 0755
+    root->size = 0;
+    root->first_block = FS_INVALID_BLOCK;
+    root->next_entry = -1;
+    root->owner_uid = ROOT_UID;
+    root->owner_gid = ROOT_GID;
+    root->in_use = 1;
+
+    sb.root_dir_head = 0;
+    sb.num_files = 1;
+    root_dir_index = 0;
+
     fs_sync_metadata();
 
-    printf("Filesystem formatted. Root user and group created.\n");
+    printf("Filesystem formatted. Root user, group, and root directory created.\n");
 }
 
 // Open or create the backing file and load/initialise the FS

@@ -14,5 +14,7 @@ uint32_t current_gid = ROOT_GID;
 int current_file_index = -1;
 uint32_t current_file_flags = 0;
 
+int root_dir_index = -1;
+
 uint64_t free_bitmap[BITMAP_MAX_WORDS];
 uint32_t bitmap_num_words = 0;

@@ -20,6 +20,9 @@ extern uint32_t current_gid;
 extern int current_file_index;
 extern uint32_t current_file_flags;
 
+// Root directory file_table index
+extern int root_dir_index;
+
 // Free space bitmap
 extern uint64_t free_bitmap[BITMAP_MAX_WORDS];
 extern uint32_t bitmap_num_words;

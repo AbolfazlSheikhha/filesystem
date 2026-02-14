@@ -8,8 +8,13 @@
 #define FS_MAX_FILES   10000
 #define FS_FILENAME_MAX 64
 #define FS_MAGIC       0xDEADBEEF
-#define FS_VERSION     2                // Updated version for user/group support
+#define FS_VERSION     3                // Version 3: directory support
 #define FS_INVALID_BLOCK 0xFFFFFFFFu    // "no block"
+#define FS_INVALID_ENTRY (-1)           // "no file entry"
+
+// File type constants
+#define FS_TYPE_REGULAR   0
+#define FS_TYPE_DIRECTORY 1
 
 #define FLAG_CREATE    0x1              // open() flag: create file if missing
 #define FLAG_WRITE     0x2              // open() flag: open for writing
