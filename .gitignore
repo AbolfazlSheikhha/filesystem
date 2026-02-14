@@ -22,3 +22,10 @@ filesys.db
 
 docs/
 mkfs_deadbeef
+lkm/*.o
+lkm/*.ko
+lkm/*.mod*
+lkm/Module.symvers
+lkm/modules.order
+lkm/.*.cmd
+lkm/.tmp_versions/
