@@ -1357,6 +1357,83 @@ static int deadbeef_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 }
 
 /* ================================================================
+ *  rename — move/rename files and directories
+ * ================================================================ */
+
+static int deadbeef_rename(struct mnt_idmap *idmap,
+			   struct inode *old_dir, struct dentry *old_dentry,
+			   struct inode *new_dir, struct dentry *new_dentry,
+			   unsigned int flags)
+{
+	struct super_block *sb = old_dir->i_sb;
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_inode_info *old_di = DEADBEEF_I(old_dir);
+	struct deadbeef_inode_info *new_di = DEADBEEF_I(new_dir);
+	struct inode *old_inode = d_inode(old_dentry);
+	struct inode *new_inode = d_inode(new_dentry);
+	struct deadbeef_inode_info *di = DEADBEEF_I(old_inode);
+	struct deadbeef_disk_file *fe;
+	int ret;
+
+	/* We don't support RENAME_EXCHANGE or RENAME_NOREPLACE flags */
+	if (flags & ~RENAME_NOREPLACE)
+		return -EINVAL;
+
+	down_write(&sbi->meta_rwsem);
+
+	/* If target exists, remove it first (unless NOREPLACE) */
+	if (new_inode) {
+		if (flags & RENAME_NOREPLACE) {
+			up_write(&sbi->meta_rwsem);
+			return -EEXIST;
+		}
+		/* Remove existing target */
+		struct deadbeef_inode_info *new_file_di = DEADBEEF_I(new_inode);
+		struct deadbeef_disk_file *new_fe = &sbi->file_table[new_file_di->file_index];
+
+		if (S_ISDIR(new_inode->i_mode)) {
+			if (new_fe->size > 0) {
+				up_write(&sbi->meta_rwsem);
+				return -ENOTEMPTY;
+			}
+			inode_dec_link_count(new_dir);
+		}
+		deadbeef_dir_remove(sb, new_di->file_index, new_dentry->d_name.name);
+		deadbeef_delete_entry(sb, new_file_di->file_index);
+		inode_dec_link_count(new_inode);
+	}
+
+	/* Remove from old directory */
+	deadbeef_dir_remove(sb, old_di->file_index, old_dentry->d_name.name);
+
+	/* Update file name in file_table */
+	fe = &sbi->file_table[di->file_index];
+	memset(fe->name, 0, DEADBEEF_FILENAME_MAX);
+	strncpy(fe->name, new_dentry->d_name.name, DEADBEEF_FILENAME_MAX - 1);
+
+	/* Add to new directory */
+	ret = deadbeef_dir_add(sb, new_di->file_index,
+			       new_dentry->d_name.name, di->file_index, new_di);
+	if (ret) {
+		/* Try to restore old entry on failure */
+		deadbeef_dir_add(sb, old_di->file_index,
+				 old_dentry->d_name.name, di->file_index, old_di);
+		up_write(&sbi->meta_rwsem);
+		return ret;
+	}
+
+	/* Update link counts for directory moves */
+	if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
+		inode_dec_link_count(old_dir);
+		inode_inc_link_count(new_dir);
+	}
+
+	deadbeef_sync_metadata(sb);
+	up_write(&sbi->meta_rwsem);
+	return 0;
+}
+
+/* ================================================================
  *  Operation tables
  * ================================================================ */
 
@@ -1366,6 +1443,7 @@ static const struct inode_operations deadbeef_dir_iops = {
 	.mkdir   = deadbeef_mkdir,
 	.unlink  = deadbeef_unlink,
 	.rmdir   = deadbeef_rmdir,
+	.rename  = deadbeef_rename,
 	.setattr = deadbeef_setattr,
 	.getattr = simple_getattr,
 };
