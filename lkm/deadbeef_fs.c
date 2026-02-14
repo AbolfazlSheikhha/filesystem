@@ -17,6 +17,7 @@
 #include <linux/blkdev.h>
 #include <linux/statfs.h>
 #include <linux/vmalloc.h>
+#include <linux/cred.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Abolfazl");
@@ -722,8 +723,8 @@ static int deadbeef_create(struct mnt_idmap *idmap, struct inode *dir,
 	fe->size        = 0;
 	fe->first_block = DEADBEEF_INVALID_BLOCK;
 	fe->next_entry  = sbi->dsb.root_dir_head;
-	fe->owner_uid   = i_uid_read(dir);
-	fe->owner_gid   = i_gid_read(dir);
+	fe->owner_uid   = from_kuid(&init_user_ns, current_fsuid());
+	fe->owner_gid   = from_kgid(&init_user_ns, current_fsgid());
 	fe->in_use      = 1;
 	sbi->dsb.root_dir_head = slot;
 	sbi->dsb.num_files++;
@@ -774,8 +775,8 @@ static int deadbeef_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	fe->size        = 0;
 	fe->first_block = DEADBEEF_INVALID_BLOCK;
 	fe->next_entry  = sbi->dsb.root_dir_head;
-	fe->owner_uid   = i_uid_read(dir);
-	fe->owner_gid   = i_gid_read(dir);
+	fe->owner_uid   = from_kuid(&init_user_ns, current_fsuid());
+	fe->owner_gid   = from_kgid(&init_user_ns, current_fsgid());
 	fe->in_use      = 1;
 	sbi->dsb.root_dir_head = slot;
 	sbi->dsb.num_files++;
@@ -1167,19 +1168,133 @@ static int deadbeef_iterate(struct file *filp, struct dir_context *ctx)
 }
 
 /* ================================================================
+ *  setattr — persist chmod / chown / truncate to disk
+ * ================================================================ */
+
+/* Truncate a file to new_size.  Caller holds meta_rwsem exclusive. */
+static int deadbeef_truncate(struct super_block *sb,
+			     struct deadbeef_disk_file *fe,
+			     u32 new_size)
+{
+	u32 data_per_block = DEADBEEF_BLOCK_DATA_SIZE;
+
+	if (new_size > fe->size) {
+		/* Growing — allocate more blocks and zero-fill */
+		int ret = deadbeef_ensure_capacity(sb, fe, new_size);
+		if (ret)
+			return ret;
+	} else if (new_size == 0) {
+		/* Truncate to zero — free all blocks */
+		deadbeef_free_chain(sb, fe->first_block);
+		fe->first_block = DEADBEEF_INVALID_BLOCK;
+	} else {
+		/* Shrinking — keep only the needed blocks, free the rest */
+		u32 keep_blocks = (new_size + data_per_block - 1) / data_per_block;
+		u32 blk_idx = fe->first_block, prev = DEADBEEF_INVALID_BLOCK;
+		u32 i;
+		struct deadbeef_disk_block *blk;
+
+		blk = kmalloc(sizeof(*blk), GFP_KERNEL);
+		if (!blk)
+			return -ENOMEM;
+
+		for (i = 0; i < keep_blocks; i++) {
+			if (blk_idx == DEADBEEF_INVALID_BLOCK)
+				break;
+			if (deadbeef_read_block(sb, blk_idx, blk)) {
+				kfree(blk);
+				return -EIO;
+			}
+			prev = blk_idx;
+			blk_idx = blk->next_block;
+		}
+
+		/* Sever the chain after the last kept block */
+		if (prev != DEADBEEF_INVALID_BLOCK) {
+			if (deadbeef_read_block(sb, prev, blk)) {
+				kfree(blk);
+				return -EIO;
+			}
+			blk->next_block = DEADBEEF_INVALID_BLOCK;
+			deadbeef_write_block(sb, prev, blk);
+		}
+
+		/* Free everything after */
+		deadbeef_free_chain(sb, blk_idx);
+		kfree(blk);
+	}
+
+	fe->size = new_size;
+	return 0;
+}
+
+static int deadbeef_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			    struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	struct super_block *sb = inode->i_sb;
+	struct deadbeef_sb_info *sbi = DEADBEEF_SB(sb);
+	struct deadbeef_inode_info *di = DEADBEEF_I(inode);
+	struct deadbeef_disk_file *fe;
+	int ret;
+
+	ret = setattr_prepare(idmap, dentry, attr);
+	if (ret)
+		return ret;
+
+	down_write(&sbi->meta_rwsem);
+	fe = &sbi->file_table[di->file_index];
+
+	if (attr->ia_valid & ATTR_SIZE) {
+		down_write(&di->data_rwsem);
+		ret = deadbeef_truncate(sb, fe, (u32)attr->ia_size);
+		if (ret) {
+			up_write(&di->data_rwsem);
+			up_write(&sbi->meta_rwsem);
+			return ret;
+		}
+		i_size_write(inode, fe->size);
+		up_write(&di->data_rwsem);
+	}
+
+	if (attr->ia_valid & ATTR_MODE) {
+		fe->permissions = attr->ia_mode & 0777;
+		inode->i_mode = (inode->i_mode & S_IFMT) | fe->permissions;
+	}
+
+	if (attr->ia_valid & ATTR_UID) {
+		fe->owner_uid = from_kuid(&init_user_ns, attr->ia_uid);
+		i_uid_write(inode, fe->owner_uid);
+	}
+
+	if (attr->ia_valid & ATTR_GID) {
+		fe->owner_gid = from_kgid(&init_user_ns, attr->ia_gid);
+		i_gid_write(inode, fe->owner_gid);
+	}
+
+	deadbeef_sync_metadata(sb);
+	up_write(&sbi->meta_rwsem);
+
+	setattr_copy(idmap, inode, attr);
+	return 0;
+}
+
+/* ================================================================
  *  Operation tables
  * ================================================================ */
 
 static const struct inode_operations deadbeef_dir_iops = {
-	.lookup = deadbeef_lookup,
-	.create = deadbeef_create,
-	.mkdir  = deadbeef_mkdir,
-	.unlink = deadbeef_unlink,
-	.rmdir  = deadbeef_rmdir,
+	.lookup  = deadbeef_lookup,
+	.create  = deadbeef_create,
+	.mkdir   = deadbeef_mkdir,
+	.unlink  = deadbeef_unlink,
+	.rmdir   = deadbeef_rmdir,
+	.setattr = deadbeef_setattr,
+	.getattr = simple_getattr,
 };
 
 static const struct inode_operations deadbeef_file_iops = {
-	.setattr = simple_setattr,
+	.setattr = deadbeef_setattr,
 	.getattr = simple_getattr,
 };
 
